@@ -1091,6 +1091,35 @@ Legacy compatibility example:
 }
 ```
 
+##### Session Auto Commit Configuration
+
+`server.session_auto_commit` controls server-wide automatic session commit behavior.
+
+```json
+{
+  "server": {
+    "session_auto_commit": {
+      "idle_enabled": true,
+      "check_interval_seconds": 60.0
+    }
+  }
+}
+```
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `idle_enabled` | bool | Enables the server-side idle-timeout auto-commit scheduler. When disabled, the idle scheduler is not started and the idle index is not maintained. Token-threshold immediate triggering still works | `true` |
+| `check_interval_seconds` | float | Poll interval for the idle scheduler in seconds. Must be greater than `0` | `60.0` |
+
+Notes:
+
+- `server.session_auto_commit` is a server-wide control surface, not a per-session business policy.
+- Per-session auto-commit behavior is configured through `auto_commit_policy` on message write APIs and persisted into session metadata.
+- When `idle_enabled=false`:
+  - `SessionAutoCommitScheduler` is not started
+  - `/local/_system/session_auto_commit/index.json` is not maintained
+- Token-threshold auto commit does not depend on the scheduler and is unaffected by this switch.
+
 
 ##### S3 Backend Configuration
 

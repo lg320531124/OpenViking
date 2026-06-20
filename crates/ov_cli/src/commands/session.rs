@@ -295,12 +295,49 @@ fn message_body(role: &str, content: &str) -> serde_json::Value {
     })
 }
 
+fn apply_auto_commit_policy(
+    body: &mut serde_json::Value,
+    enabled: Option<bool>,
+    token_threshold: Option<u32>,
+    idle_timeout_seconds: Option<u32>,
+    keep_recent_count: Option<u32>,
+) {
+    if enabled.is_none()
+        && token_threshold.is_none()
+        && idle_timeout_seconds.is_none()
+        && keep_recent_count.is_none()
+    {
+        return;
+    }
+    let mut policy = serde_json::Map::new();
+    if let Some(enabled) = enabled {
+        policy.insert("enabled".to_string(), json!(enabled));
+    }
+    if let Some(token_threshold) = token_threshold {
+        policy.insert("token_threshold".to_string(), json!(token_threshold));
+    }
+    if let Some(idle_timeout_seconds) = idle_timeout_seconds {
+        policy.insert(
+            "idle_timeout_seconds".to_string(),
+            json!(idle_timeout_seconds),
+        );
+    }
+    if let Some(keep_recent_count) = keep_recent_count {
+        policy.insert("keep_recent_count".to_string(), json!(keep_recent_count));
+    }
+    body["auto_commit_policy"] = serde_json::Value::Object(policy);
+}
+
 pub async fn add_message(
     client: &HttpClient,
     session_id: &str,
     role: &str,
     content: &str,
     peer_id: Option<&str>,
+    auto_commit_enabled: Option<bool>,
+    token_threshold: Option<u32>,
+    idle_timeout_seconds: Option<u32>,
+    keep_recent_count: Option<u32>,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
@@ -312,6 +349,13 @@ pub async fn add_message(
     if let Some(peer_id) = peer_id {
         body["peer_id"] = json!(peer_id);
     }
+    apply_auto_commit_policy(
+        &mut body,
+        auto_commit_enabled,
+        token_threshold,
+        idle_timeout_seconds,
+        keep_recent_count,
+    );
 
     let response: serde_json::Value = client.post(&path, &body).await?;
     output_success(&response, output_format, compact);
@@ -322,6 +366,10 @@ pub async fn add_messages(
     client: &HttpClient,
     session_id: &str,
     input: &str,
+    auto_commit_enabled: Option<bool>,
+    token_threshold: Option<u32>,
+    idle_timeout_seconds: Option<u32>,
+    keep_recent_count: Option<u32>,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
@@ -331,7 +379,14 @@ pub async fn add_messages(
         .iter()
         .map(|(role, content)| message_body(role, content))
         .collect();
-    let body = json!({"messages": messages_json});
+    let mut body = json!({"messages": messages_json});
+    apply_auto_commit_policy(
+        &mut body,
+        auto_commit_enabled,
+        token_threshold,
+        idle_timeout_seconds,
+        keep_recent_count,
+    );
     let response: serde_json::Value = client.post(&path, &body).await?;
     output_success(&response, output_format, compact);
     Ok(())
@@ -414,7 +469,8 @@ fn url_encode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_messages, render_session_get_for_table};
+    use super::{apply_auto_commit_policy, message_body, parse_messages, render_session_get_for_table};
+    use crate::client::HttpClient;
     use crate::error::Error;
     use serde_json::json;
 
@@ -512,6 +568,55 @@ mod tests {
         let result = json!({"status": "ok"});
 
         assert!(render_session_get_for_table(&result).is_none());
+    }
+
+    #[test]
+    fn apply_auto_commit_policy_skips_empty_policy() {
+        let mut body = json!({"role": "user", "content": "hello"});
+
+        apply_auto_commit_policy(&mut body, None, None, None, None);
+
+        assert!(body.get("auto_commit_policy").is_none());
+    }
+
+    #[test]
+    fn apply_auto_commit_policy_adds_top_level_policy() {
+        let mut body = json!({"messages": [{"role": "user", "content": "hello"}]});
+
+        apply_auto_commit_policy(&mut body, Some(true), Some(128), Some(30), Some(2));
+
+        assert_eq!(
+            body,
+            json!({
+                "messages": [{"role": "user", "content": "hello"}],
+                "auto_commit_policy": {
+                    "enabled": true,
+                    "token_threshold": 128,
+                    "idle_timeout_seconds": 30,
+                    "keep_recent_count": 2
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn message_body_preserves_message_shape_without_auto_commit_policy() {
+        let client = HttpClient::new(
+            "http://localhost:1933".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            5.0,
+            false,
+            None,
+        );
+
+        let body = message_body(&client, "user", "hello");
+
+        assert_eq!(body, json!({"role": "user", "content": "hello"}));
+        assert!(body.get("auto_commit_policy").is_none());
     }
 
     fn strip_ansi(input: &str) -> String {

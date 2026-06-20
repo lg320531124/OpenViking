@@ -1063,6 +1063,35 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 }
 ```
 
+##### Session Auto Commit 配置
+
+`server.session_auto_commit` 用于控制服务端 session 自动 commit 的全局行为。
+
+```json
+{
+  "server": {
+    "session_auto_commit": {
+      "idle_enabled": true,
+      "check_interval_seconds": 60.0
+    }
+  }
+}
+```
+
+| 参数 | 类型 | 说明 | 默认值 |
+|------|------|------|--------|
+| `idle_enabled` | bool | 是否启用服务端 idle timeout 自动 commit 调度器。关闭后，不会启动 idle scheduler，也不会维护 idle 索引；但 token threshold 的即时触发仍然生效 | `true` |
+| `check_interval_seconds` | float | idle scheduler 的检查周期，单位秒，必须大于 `0` | `60.0` |
+
+说明：
+
+- `server.session_auto_commit` 是服务端全局配置，不是单个 session 的业务 policy。
+- session 级别的自动触发参数通过消息写入接口中的 `auto_commit_policy` 设置，并持久化到 session meta。
+- `idle_enabled=false` 时：
+  - 不会启动 `SessionAutoCommitScheduler`
+  - 不会维护 `/local/_system/session_auto_commit/index.json`
+- token threshold 自动触发不依赖 scheduler，所以不受这个开关影响。
+
 
 ##### S3 后端配置
 
