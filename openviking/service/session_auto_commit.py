@@ -6,256 +6,20 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from openviking.pyagfs import AsyncAGFSClient
+from openviking.server.error_mapping import is_not_found_error
 from openviking.server.identity import RequestContext, Role
-from openviking.session import Session
-from openviking.utils.time_utils import get_current_timestamp
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
 
-SESSION_AUTO_COMMIT_INDEX_URI = "/local/_system/session_auto_commit/index.json"
-
-
-@dataclass(frozen=True)
-class IndexedSession:
-    account_id: str
-    user_id: str
-    session_id: str
-    next_check_at: str = ""
-
-
-class SessionAutoCommitIndex:
-    """Persistent membership index of active idle auto-commit candidates."""
-
-    def __init__(self, viking_fs: Any):
-        self._viking_fs = viking_fs
-        self._agfs = AsyncAGFSClient(viking_fs.agfs)
-        self._lock = asyncio.Lock()
-        self._ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
-        self._initialized = False
-        self._runtime_next_check_at: Dict[Tuple[str, str, str], str] = {}
-
-    async def initialize(self) -> None:
-        if self._initialized:
-            return
-        async with self._lock:
-            if self._initialized:
-                return
-            logger.info("SessionAutoCommitIndex ready at %s", SESSION_AUTO_COMMIT_INDEX_URI)
-            self._initialized = True
-
-    async def list_sessions(self) -> List[IndexedSession]:
-        await self.initialize()
-        async with self._lock:
-            data = await self._read_index_file(SESSION_AUTO_COMMIT_INDEX_URI)
-            normalized = _normalize_index_data(data)
-            results: List[IndexedSession] = []
-            for item in _iter_indexed_sessions(normalized):
-                results.append(
-                    IndexedSession(
-                        account_id=item.account_id,
-                        user_id=item.user_id,
-                        session_id=item.session_id,
-                        next_check_at=self._runtime_next_check_at.get(_session_key(item), ""),
-                    )
-                )
-            return results
-
-    async def get_next_due_sessions(self, now: datetime) -> List[IndexedSession]:
-        await self.initialize()
-        due: List[IndexedSession] = []
-        async with self._lock:
-            for item in _iter_runtime_sessions(self._runtime_next_check_at):
-                is_due = is_next_check_due(self._runtime_next_check_at[_session_key(item)], now)
-                if is_due is None:
-                    continue
-                if is_due:
-                    due.append(item)
-        return due
-
-    async def upsert_session(
-        self,
-        account_id: str,
-        user_id: str,
-        session_id: str,
-        *,
-        next_check_at: str,
-    ) -> None:
-        await self.initialize()
-        async with self._lock:
-            data = await self._read_current_index_locked()
-            session_node = (
-                data.setdefault("data", {}).setdefault(account_id, {}).setdefault(user_id, {})
-            )
-            key = _session_key_from_parts(account_id, user_id, session_id)
-            self._runtime_next_check_at[key] = next_check_at
-            if session_id in session_node:
-                return
-            session_node[session_id] = {}
-            data.setdefault("meta", {})["updated_at"] = get_current_timestamp()
-            await self._persist_locked(data)
-
-    async def remove_session(self, account_id: str, user_id: str, session_id: str) -> None:
-        await self.initialize()
-        async with self._lock:
-            self._runtime_next_check_at.pop(
-                _session_key_from_parts(account_id, user_id, session_id), None
-            )
-            data = await self._read_current_index_locked()
-            users = data.get("data", {}).get(account_id)
-            if not isinstance(users, dict):
-                return
-            sessions = users.get(user_id)
-            if not isinstance(sessions, dict) or session_id not in sessions:
-                return
-            sessions.pop(session_id, None)
-            if not sessions:
-                users.pop(user_id, None)
-            if not users:
-                data.get("data", {}).pop(account_id, None)
-            data.setdefault("meta", {})["updated_at"] = get_current_timestamp()
-            await self._persist_locked(data)
-
-    async def refresh_runtime_session(self, session: Session) -> None:
-        await self.initialize()
-        async with self._lock:
-            next_check_at = _compute_runtime_next_check_at(session)
-            key = _session_key_from_parts(
-                session.ctx.account_id, session.ctx.user.user_id, session.session_id
-            )
-            if next_check_at:
-                self._runtime_next_check_at[key] = next_check_at
-            else:
-                self._runtime_next_check_at.pop(key, None)
-
-    async def sync_runtime_state(self, load_session: Any) -> List[IndexedSession]:
-        await self.initialize()
-        async with self._lock:
-            data = await self._read_current_index_locked()
-            indexed_items = list(_iter_indexed_sessions(data))
-            current_keys = {_session_key(item) for item in indexed_items}
-            stale_keys = [key for key in self._runtime_next_check_at if key not in current_keys]
-            for key in stale_keys:
-                self._runtime_next_check_at.pop(key, None)
-            missing_items = [
-                item
-                for item in indexed_items
-                if _session_key(item) not in self._runtime_next_check_at
-            ]
-
-        resolved_next_check_at: Dict[Tuple[str, str, str], str] = {}
-        removable_keys: set[Tuple[str, str, str]] = set()
-        for item in missing_items:
-            try:
-                session = await load_session(item.account_id, item.user_id, item.session_id)
-            except Exception:
-                logger.debug(
-                    "SessionAutoCommitIndex failed to sync runtime session %s/%s/%s",
-                    item.account_id,
-                    item.user_id,
-                    item.session_id,
-                    exc_info=True,
-                )
-                continue
-            if session is None:
-                removable_keys.add(_session_key(item))
-                continue
-            next_check_at = _compute_runtime_next_check_at(session)
-            if not next_check_at:
-                removable_keys.add(_session_key(item))
-                continue
-            resolved_next_check_at[_session_key(item)] = next_check_at
-
-        async with self._lock:
-            data = await self._read_current_index_locked()
-            indexed_items = list(_iter_indexed_sessions(data))
-            changed = False
-
-            current_keys = {_session_key(item) for item in indexed_items}
-            stale_keys = [key for key in self._runtime_next_check_at if key not in current_keys]
-            for key in stale_keys:
-                self._runtime_next_check_at.pop(key, None)
-
-            for key, next_check_at in resolved_next_check_at.items():
-                if key in current_keys:
-                    self._runtime_next_check_at[key] = next_check_at
-
-            for item in indexed_items:
-                key = _session_key(item)
-                if key in removable_keys:
-                    changed = _remove_membership_from_data(data, item) or changed
-                    self._runtime_next_check_at.pop(key, None)
-
-            if changed:
-                data.setdefault("meta", {})["updated_at"] = get_current_timestamp()
-                await self._persist_locked(data)
-                indexed_items = list(_iter_indexed_sessions(data))
-
-            results: List[IndexedSession] = []
-            for item in indexed_items:
-                results.append(
-                    IndexedSession(
-                        account_id=item.account_id,
-                        user_id=item.user_id,
-                        session_id=item.session_id,
-                        next_check_at=self._runtime_next_check_at.get(_session_key(item), ""),
-                    )
-                )
-            return results
-
-    async def _read_current_index_locked(self) -> Dict[str, Any]:
-        data = await self._read_index_file(SESSION_AUTO_COMMIT_INDEX_URI)
-        return _normalize_index_data(data)
-
-    async def _read_index_file(self, path: str) -> Optional[Dict[str, Any]]:
-        try:
-            raw = await self._agfs.read(path)
-        except Exception as exc:
-            if _is_index_file_missing(exc, path):
-                logger.debug("SessionAutoCommitIndex index file missing: %s", path)
-                return None
-            logger.warning("SessionAutoCommitIndex failed to read %s: %s", path, exc)
-            return None
-        content = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
-        if not content or not content.strip():
-            logger.debug("SessionAutoCommitIndex read empty content from %s", path)
-            return None
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError as exc:
-            logger.warning("Invalid session auto-commit index JSON in %s: %s", path, exc)
-            return None
-
-    async def _persist_locked(self, data: Dict[str, Any]) -> None:
-        content = json.dumps(data, ensure_ascii=False, indent=2)
-        json.loads(content)
-
-        await self._ensure_parent_dirs(SESSION_AUTO_COMMIT_INDEX_URI)
-        await self._agfs.write(SESSION_AUTO_COMMIT_INDEX_URI, content.encode("utf-8"))
-        logger.debug(
-            "SessionAutoCommitIndex persisted sessions=%d updated_at=%s",
-            len(_iter_indexed_sessions(data)),
-            data.get("meta", {}).get("updated_at", ""),
-        )
-
-    async def _ensure_parent_dirs(self, path: str) -> None:
-        parent = path.rsplit("/", 1)[0]
-        try:
-            await self._agfs.ensure_parent_dirs(path)
-            return
-        except AttributeError:
-            if parent:
-                await self._agfs.mkdir(parent)
-            return
-        except Exception as exc:
-            logger.warning("Failed to ensure session auto-commit index parent dirs: %s", exc)
-            raise
+SESSION_META_SUFFIX = "/.meta.json"
+AGFS_SESSION_SCAN_ROOT = "/local"
 
 
 class SessionAutoCommitScheduler:
@@ -269,25 +33,25 @@ class SessionAutoCommitScheduler:
         config: Any,
         *,
         check_interval: Optional[float] = None,
+        sleep: Any = asyncio.sleep,
     ):
         self._session_service = session_service
         self._config = config
         self._check_interval = (
             self.DEFAULT_CHECK_INTERVAL if check_interval is None else float(check_interval)
         )
-        self._index: Optional[SessionAutoCommitIndex] = None
+        self._scan_batch_size = max(1, int(getattr(config, "scan_batch_size", 16) or 16))
+        self._scan_batch_pause_seconds = max(
+            0.0,
+            float(getattr(config, "scan_batch_pause_seconds", 0.0) or 0.0),
+        )
+        self._sleep = sleep
         self._running = False
         self._task: Optional[asyncio.Task] = None
-
-    @property
-    def index(self) -> Optional[SessionAutoCommitIndex]:
-        return self._index
 
     async def start(self) -> None:
         if self._running:
             return
-        self._index = SessionAutoCommitIndex(self._session_service.viking_fs)
-        await self._index.initialize()
         self._running = True
         logger.info(
             "SessionAutoCommitScheduler started with check interval %.3fs", self._check_interval
@@ -307,55 +71,174 @@ class SessionAutoCommitScheduler:
     async def _run_loop(self) -> None:
         while self._running:
             try:
-                if self._config.idle_enabled and self._index is not None:
-                    indexed = await self._index.sync_runtime_state(self._load_session_for_runtime)
-                    due = await self._index.get_next_due_sessions(datetime.now())
-                    if due:
-                        due_details = [
-                            f"{item.account_id}/{item.user_id}/{item.session_id}@{item.next_check_at}"
-                            for item in due
-                        ]
-                        logger.info(
-                            "SessionAutoCommitScheduler indexed=%d due=%d sessions=%s",
-                            len(indexed),
-                            len(due),
-                            due_details,
-                        )
-                    for item in due:
-                        ctx = RequestContext(
-                            user=UserIdentifier(account_id=item.account_id, user_id=item.user_id),
-                            role=Role.USER,
-                        )
-                        await self._session_service.maybe_schedule_auto_commit(
-                            item.session_id,
-                            ctx,
-                            reason_hint="idle_timeout",
-                        )
-            except Exception as exc:
-                logger.error("Session auto-commit scheduler loop failed: %s", exc, exc_info=True)
-            try:
-                await asyncio.sleep(self._check_interval)
+                await self._sleep(self._check_interval)
             except asyncio.CancelledError:
                 break
 
-    async def _load_session_for_runtime(
-        self, account_id: str, user_id: str, session_id: str
-    ) -> Optional[Session]:
-        ctx = RequestContext(
-            user=UserIdentifier(account_id=account_id, user_id=user_id),
-            role=Role.USER,
+            try:
+                if self._config.idle_enabled:
+                    await self._scan_once()
+            except Exception as exc:
+                logger.error("Session auto-commit scheduler loop failed: %s", exc, exc_info=True)
+
+    async def _scan_once(self) -> None:
+        now = datetime.now()
+        scanned = 0
+        due = 0
+        agfs = AsyncAGFSClient(self._session_service.viking_fs.agfs)
+        async for batch in self._iter_session_meta_path_batches(agfs):
+            batch_scanned, batch_due = await self._process_meta_batch(agfs, batch, now)
+            scanned += batch_scanned
+            due += batch_due
+
+        if due > 0:
+            logger.info("SessionAutoCommitScheduler scanned=%d due=%d", scanned, due)
+
+    async def _process_meta_batch(
+        self,
+        agfs: AsyncAGFSClient,
+        batch: list[str],
+        now: datetime,
+    ) -> tuple[int, int]:
+        results = await asyncio.gather(
+            *(self._read_idle_candidate(agfs, meta_path, now) for meta_path in batch)
         )
-        try:
-            return await self._session_service.get(session_id, ctx, auto_create=False)
-        except Exception:
-            logger.debug(
-                "SessionAutoCommitScheduler failed to load session for runtime sync: %s/%s/%s",
-                account_id,
-                user_id,
+        due = 0
+        for item in results:
+            if item is None:
+                continue
+            session_id, account_id, user_id = item
+            due += 1
+            ctx = RequestContext(
+                user=UserIdentifier(account_id=account_id, user_id=user_id),
+                role=Role.USER,
+            )
+            await self._session_service.maybe_schedule_auto_commit(
                 session_id,
+                ctx,
+                reason_hint="idle_timeout",
+            )
+        return len(batch), due
+
+    async def _read_idle_candidate(
+        self,
+        agfs: AsyncAGFSClient,
+        meta_path: str,
+        now: datetime,
+    ) -> Optional[tuple[str, str, str]]:
+        try:
+            content = await agfs.read(meta_path)
+            raw = content.decode("utf-8") if isinstance(content, bytes) else str(content)
+            meta = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "Invalid session meta JSON for idle auto-commit: %s (%s)",
+                meta_path,
+                exc,
+            )
+            return None
+        except Exception as exc:
+            if is_not_found_error(exc):
+                logger.debug(
+                    "Session meta disappeared during idle auto-commit scan: %s",
+                    meta_path,
+                )
+                return None
+            logger.warning(
+                "Failed to read session meta for idle auto-commit: %s",
+                meta_path,
                 exc_info=True,
             )
             return None
+
+        try:
+            if not _is_idle_candidate(meta, now):
+                return None
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "Invalid session meta fields for idle auto-commit: %s (%s)",
+                meta_path,
+                exc,
+            )
+            return None
+
+        session_id = _session_id_from_meta_path(meta_path)
+        account_id = _account_id_from_meta_path(meta_path)
+        user_id = _user_id_from_meta_path(meta_path)
+        if not session_id or not account_id or not user_id:
+            return None
+        return session_id, account_id, user_id
+
+    async def _iter_session_meta_path_batches(
+        self, agfs: AsyncAGFSClient
+    ) -> AsyncIterator[list[str]]:
+        try:
+            account_entries = await agfs.ls(AGFS_SESSION_SCAN_ROOT)
+        except Exception:
+            logger.warning("Failed to scan AGFS tree for idle auto-commit", exc_info=True)
+            return
+
+        batch: list[str] = []
+        seen: set[str] = set()
+        for account_entry in account_entries:
+            account_id = str(account_entry.get("name") or "").strip()
+            if not account_id or account_id == "_system":
+                continue
+            if not account_entry.get("isDir", False):
+                continue
+
+            try:
+                user_entries = await agfs.ls(f"/local/{account_id}/user")
+            except Exception as exc:
+                if is_not_found_error(exc):
+                    logger.debug(
+                        "Account user directory missing during idle auto-commit scan: %s",
+                        account_id,
+                    )
+                else:
+                    logger.warning(
+                        "Failed to scan users for idle auto-commit: /local/%s/user",
+                        account_id,
+                        exc_info=True,
+                    )
+                continue
+
+            for user_entry in user_entries:
+                user_id = str(user_entry.get("name") or "").strip()
+                if not user_id or not user_entry.get("isDir", False):
+                    continue
+                sessions_root = f"/local/{account_id}/user/{user_id}/sessions"
+                try:
+                    session_entries = await agfs.ls(sessions_root)
+                except Exception as exc:
+                    if is_not_found_error(exc):
+                        logger.debug(
+                            "User sessions directory missing during idle auto-commit scan: %s",
+                            sessions_root,
+                        )
+                    else:
+                        logger.warning(
+                            "Failed to scan sessions for idle auto-commit: %s",
+                            sessions_root,
+                            exc_info=True,
+                        )
+                    continue
+
+                for session_entry in session_entries:
+                    session_id = str(session_entry.get("name") or "").strip()
+                    if not session_id or not session_entry.get("isDir", False):
+                        continue
+                    meta_path = f"{sessions_root}/{session_id}{SESSION_META_SUFFIX}"
+                    if meta_path not in seen:
+                        seen.add(meta_path)
+                        batch.append(meta_path)
+                    if len(batch) >= self._scan_batch_size:
+                        yield batch
+                        batch = []
+                        if self._scan_batch_pause_seconds > 0:
+                            await self._sleep(self._scan_batch_pause_seconds)
+        if batch:
+            yield batch
 
 
 def should_enable_auto_commit(policy: Optional[Dict[str, Any]]) -> bool:
@@ -416,103 +299,52 @@ def is_next_check_due(next_check_at: str, now: datetime) -> Optional[bool]:
     return next_dt <= compare_now
 
 
-def _normalize_index_data(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if not isinstance(data, dict):
-        return {"meta": {"updated_at": ""}, "data": {}}
-    normalized = json.loads(json.dumps(data, ensure_ascii=False))
-    if not isinstance(normalized.get("meta"), dict):
-        normalized["meta"] = {"updated_at": ""}
-    if not isinstance(normalized.get("data"), dict):
-        normalized["data"] = {}
-    return normalized
+def has_uncommitted_content(meta: Dict[str, Any]) -> bool:
+    keep_recent_count = _coerce_non_negative_int(meta.get("keep_recent_count", 0))
+    return bool(
+        _coerce_non_negative_int(meta.get("pending_tokens", 0)) > 0
+        or _coerce_non_negative_int(meta.get("message_count", 0)) > keep_recent_count
+    )
 
 
-def _session_key(item: IndexedSession) -> Tuple[str, str, str]:
-    return _session_key_from_parts(item.account_id, item.user_id, item.session_id)
+def _coerce_non_negative_int(value: Any) -> int:
+    parsed = int(value or 0)
+    return max(0, parsed)
 
 
-def _session_key_from_parts(account_id: str, user_id: str, session_id: str) -> Tuple[str, str, str]:
-    return (account_id, user_id, session_id)
-
-
-def _iter_runtime_sessions(
-    runtime_next_check_at: Dict[Tuple[str, str, str], str],
-) -> List[IndexedSession]:
-    results: List[IndexedSession] = []
-    for key in runtime_next_check_at:
-        account_id, user_id, session_id = key
-        results.append(
-            IndexedSession(
-                account_id=account_id,
-                user_id=user_id,
-                session_id=session_id,
-                next_check_at=runtime_next_check_at[key],
-            )
-        )
-    return results
-
-
-def _compute_runtime_next_check_at(session: Session) -> Optional[str]:
-    policy = session.meta.auto_commit_policy
+def _is_idle_candidate(meta: Dict[str, Any], now: datetime) -> bool:
+    policy = meta.get("auto_commit_policy")
     if not should_enable_auto_commit(policy):
-        return None
+        return False
     idle_timeout = get_idle_timeout_seconds(policy)
     if idle_timeout is None:
-        return None
-    keep_recent_count = int(session.meta.keep_recent_count or 0)
-    has_uncommitted = bool(
-        int(session.meta.pending_tokens or 0) > 0
-        or int(session.meta.message_count or 0) > keep_recent_count
-    )
-    if not has_uncommitted:
-        return None
-    return compute_next_check_at(session.meta.last_message_at, idle_timeout)
-
-
-def _remove_membership_from_data(data: Dict[str, Any], item: IndexedSession) -> bool:
-    users = data.get("data", {}).get(item.account_id)
-    if not isinstance(users, dict):
         return False
-    sessions = users.get(item.user_id)
-    if not isinstance(sessions, dict) or item.session_id not in sessions:
+    if not has_uncommitted_content(meta):
         return False
-    sessions.pop(item.session_id, None)
-    if not sessions:
-        users.pop(item.user_id, None)
-    if not users:
-        data.get("data", {}).pop(item.account_id, None)
-    return True
+    next_check_at = compute_next_check_at(meta.get("last_message_at", ""), idle_timeout)
+    if not next_check_at:
+        return False
+    return is_next_check_due(next_check_at, now) is True
 
 
-def _is_index_file_missing(exc: Exception, path: str) -> bool:
-    text = str(exc).strip()
-    if text == path:
-        return True
-    lower = text.lower()
-    return path in text and (
-        "not found" in lower or "no such file" in lower or "does not exist" in lower
-    )
+def _session_id_from_meta_path(meta_path: str) -> str:
+    if not meta_path.endswith(SESSION_META_SUFFIX):
+        return ""
+    parts = [part for part in meta_path.split("/") if part]
+    if len(parts) >= 6 and parts[0] == "local" and parts[2] == "user" and parts[4] == "sessions":
+        return parts[5]
+    return ""
 
 
-def _iter_indexed_sessions(index_data: Dict[str, Any]) -> List[IndexedSession]:
-    results: List[IndexedSession] = []
-    data = index_data.get("data", {})
-    if not isinstance(data, dict):
-        return results
-    for account_id, users in data.items():
-        if not isinstance(users, dict):
-            continue
-        for user_id, sessions in users.items():
-            if not isinstance(sessions, dict):
-                continue
-            for session_id, payload in sessions.items():
-                if not isinstance(payload, dict):
-                    continue
-                results.append(
-                    IndexedSession(
-                        account_id=account_id,
-                        user_id=user_id,
-                        session_id=session_id,
-                    )
-                )
-    return results
+def _account_id_from_meta_path(meta_path: str) -> str:
+    parts = [part for part in meta_path.split("/") if part]
+    if len(parts) >= 2 and parts[0] == "local":
+        return parts[1]
+    return ""
+
+
+def _user_id_from_meta_path(meta_path: str) -> str:
+    parts = [part for part in meta_path.split("/") if part]
+    if len(parts) >= 6 and parts[0] == "local" and parts[2] == "user" and parts[4] == "sessions":
+        return parts[3]
+    return ""

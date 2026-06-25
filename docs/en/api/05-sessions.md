@@ -675,7 +675,9 @@ Additional notes:
 
 - `auto_commit_policy` is a session-level policy, not a per-message policy.
 - Once written, later server-side automatic triggering uses the persisted value from session metadata.
+- `token_threshold` is evaluated immediately after message writes and does not depend on the idle scheduler.
 - `idle_timeout_seconds` only takes effect when the server-wide `server.session_auto_commit.idle_enabled` switch is enabled.
+- When idle scheduling is enabled, the server detects due idle commits by periodic scans of session `.meta.json` files.
 
 **Part Types (Python SDK)**
 

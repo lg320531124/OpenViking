@@ -1071,8 +1071,10 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 {
   "server": {
     "session_auto_commit": {
-      "idle_enabled": true,
-      "check_interval_seconds": 60.0
+      "idle_enabled": false,
+      "check_interval_seconds": 60.0,
+      "scan_batch_size": 16,
+      "scan_batch_pause_seconds": 0.0
     }
   }
 }
@@ -1080,8 +1082,10 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 
 | 参数 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
-| `idle_enabled` | bool | 是否启用服务端 idle timeout 自动 commit 调度器。关闭后，不会启动 idle scheduler，也不会维护 idle 索引；但 token threshold 的即时触发仍然生效 | `true` |
+| `idle_enabled` | bool | 是否启用服务端 idle timeout 自动 commit 调度器。关闭后，不会启动 idle scheduler；但 token threshold 的即时触发仍然生效 | `false` |
 | `check_interval_seconds` | float | idle scheduler 的检查周期，单位秒，必须大于 `0` | `60.0` |
+| `scan_batch_size` | int | 每个 idle 扫描批次最多并发读取的 session meta 文件数量，必须大于 `0` | `16` |
+| `scan_batch_pause_seconds` | float | idle 扫描批次之间的可选暂停时间，单位秒，用于降低大量 session 扫描时的存储压力 | `0.0` |
 
 说明：
 
@@ -1089,7 +1093,9 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 - session 级别的自动触发参数通过消息写入接口中的 `auto_commit_policy` 设置，并持久化到 session meta。
 - `idle_enabled=false` 时：
   - 不会启动 `SessionAutoCommitScheduler`
-  - 不会维护 `/local/_system/session_auto_commit/index.json`
+- `idle_enabled=true` 时：
+  - `SessionAutoCommitScheduler` 会按固定周期扫描 AGFS `/local/{account}/user/{user}/sessions` 下的 session `.meta.json`
+  - 不会做单独的启动恢复扫描，idle 检查只发生在周期扫描时
 - token threshold 自动触发不依赖 scheduler，所以不受这个开关影响。
 
 

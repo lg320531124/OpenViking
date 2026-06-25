@@ -161,8 +161,10 @@ class ToolOutputExternalizationConfig(BaseModel):
 class SessionAutoCommitConfig(BaseModel):
     """Server-wide controls for automatic session commits."""
 
-    idle_enabled: bool = True
+    idle_enabled: bool = False
     check_interval_seconds: float = Field(default=60.0, gt=0)
+    scan_batch_size: int = Field(default=16, gt=0)
+    scan_batch_pause_seconds: float = Field(default=0.0, ge=0)
 
     model_config = {"extra": "forbid"}
 

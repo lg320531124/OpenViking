@@ -125,18 +125,27 @@ def test_ensure_data_dir_lock_respects_skip_process_lock(monkeypatch, tmp_path):
     assert service._data_dir_lock_acquired is True
 
 
-def test_session_auto_commit_config_defaults_to_idle_enabled():
+def test_session_auto_commit_config_defaults_to_idle_disabled():
     config = SessionAutoCommitConfig()
 
-    assert config.idle_enabled is True
+    assert config.idle_enabled is False
     assert config.check_interval_seconds == 60.0
+    assert config.scan_batch_size == 16
+    assert config.scan_batch_pause_seconds == 0.0
 
 
 def test_session_auto_commit_config_accepts_check_interval_override():
-    config = SessionAutoCommitConfig(idle_enabled=True, check_interval_seconds=3.5)
+    config = SessionAutoCommitConfig(
+        idle_enabled=True,
+        check_interval_seconds=3.5,
+        scan_batch_size=8,
+        scan_batch_pause_seconds=0.2,
+    )
 
     assert config.idle_enabled is True
     assert config.check_interval_seconds == 3.5
+    assert config.scan_batch_size == 8
+    assert config.scan_batch_pause_seconds == 0.2
 
 
 @pytest.mark.asyncio
@@ -144,7 +153,6 @@ async def test_initialize_skips_session_auto_commit_scheduler_when_idle_disabled
     """Do not create or start the idle scheduler when idle auto-commit is globally disabled."""
 
     scheduler_events: list[str] = []
-    auto_commit_index_events: list[object] = []
 
     async def _fake_init_context_collection(*_args, **_kwargs):
         return None
@@ -207,7 +215,7 @@ async def test_initialize_skips_session_auto_commit_scheduler_when_idle_disabled
     monkeypatch.setattr("openviking.service.core.SkillProcessor", lambda **_kwargs: object())
     monkeypatch.setattr(
         "openviking.service.core.get_openviking_config",
-        lambda: SimpleNamespace(rerank=object(), retrieval=object()),
+        lambda: SimpleNamespace(rerank=object(), retrieval=object(), grep=object()),
     )
     monkeypatch.setattr(
         "openviking.server.dependencies.get_server_config",
@@ -255,7 +263,6 @@ async def test_initialize_skips_session_auto_commit_scheduler_when_idle_disabled
         set_session_auto_commit_config=lambda config: setattr(
             service, "_captured_session_auto_commit_config", config
         ),
-        set_auto_commit_index=lambda index: auto_commit_index_events.append(index),
     )
     service._debug_service = SimpleNamespace(set_dependencies=lambda **_kwargs: None)
     service._init_storage = lambda *_args, **_kwargs: None
@@ -266,5 +273,4 @@ async def test_initialize_skips_session_auto_commit_scheduler_when_idle_disabled
 
     assert scheduler_events == []
     assert service._session_auto_commit_scheduler is None
-    assert auto_commit_index_events == []
     assert service._captured_session_auto_commit_config.idle_enabled is False

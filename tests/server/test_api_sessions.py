@@ -13,14 +13,11 @@ from fastapi import FastAPI
 from starlette.requests import Request
 
 from openviking.message import ImagePart, Message, TextPart
-from openviking.pyagfs import AsyncAGFSClient
-from openviking.pyagfs.exceptions import AGFSNotFoundError
 from openviking.server.app import create_app
 from openviking.server.config import ServerConfig, ToolOutputExternalizationConfig
 from openviking.server.dependencies import set_service
 from openviking.server.identity import RequestContext, Role
 from openviking.server.routers import sessions as sessions_router
-from openviking.service import session_auto_commit
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.config import OPENVIKING_CONFIG_ENV
 from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
@@ -508,9 +505,8 @@ async def test_add_message_policy_updates_keep_recent_count_for_pending_tokens(
     assert after_result["pending_tokens"] == 0
 
 
-async def test_token_only_auto_commit_policy_does_not_enter_idle_index(
+async def test_token_only_auto_commit_policy_persists_without_idle_timeout(
     client: httpx.AsyncClient,
-    service,
 ):
     create_resp = await client.post("/api/v1/sessions", json={})
     session_id = create_resp.json()["result"]["session_id"]
@@ -530,11 +526,17 @@ async def test_token_only_auto_commit_policy_does_not_enter_idle_index(
     )
     assert resp.status_code == 200
 
-    indexed = await service.sessions._auto_commit_index.list_sessions()
-    assert [item.session_id for item in indexed] == []
+    session_resp = await client.get(f"/api/v1/sessions/{session_id}")
+    result = session_resp.json()["result"]
+    assert result["auto_commit_policy"] == {
+        "enabled": True,
+        "token_threshold": 1,
+        "idle_timeout_seconds": None,
+        "keep_recent_count": 0,
+    }
 
 
-async def test_idle_auto_commit_policy_enters_idle_index(client: httpx.AsyncClient, service):
+async def test_idle_auto_commit_policy_persists_on_session_meta(client: httpx.AsyncClient):
     create_resp = await client.post("/api/v1/sessions", json={})
     session_id = create_resp.json()["result"]["session_id"]
 
@@ -553,13 +555,20 @@ async def test_idle_auto_commit_policy_enters_idle_index(client: httpx.AsyncClie
     )
     assert resp.status_code == 200
 
-    indexed = await service.sessions._auto_commit_index.list_sessions()
-    assert len(indexed) == 1
-    assert indexed[0].session_id == session_id
-    assert indexed[0].next_check_at
+    session_resp = await client.get(f"/api/v1/sessions/{session_id}")
+    result = session_resp.json()["result"]
+    assert result["auto_commit_policy"] == {
+        "enabled": True,
+        "token_threshold": None,
+        "idle_timeout_seconds": 60,
+        "keep_recent_count": 0,
+    }
+    assert result["last_message_at"]
 
 
-async def test_idle_global_switch_disables_idle_indexing(client: httpx.AsyncClient, service):
+async def test_idle_global_switch_still_persists_policy_without_idle_scheduler(
+    client: httpx.AsyncClient, service
+):
     service.sessions._session_auto_commit_config.idle_enabled = False
 
     create_resp = await client.post("/api/v1/sessions", json={})
@@ -580,57 +589,14 @@ async def test_idle_global_switch_disables_idle_indexing(client: httpx.AsyncClie
     )
     assert resp.status_code == 200
 
-    indexed = await service.sessions._auto_commit_index.list_sessions()
-    assert [item.session_id for item in indexed] == []
-
-
-async def test_idle_index_persists_to_global_system_path(service):
-    index = session_auto_commit.SessionAutoCommitIndex(service.viking_fs)
-    await index.initialize()
-    await index.upsert_session(
-        "acct_a",
-        "user_b",
-        "session_c",
-        next_check_at="2026-06-22T12:00:00+08:00",
-    )
-
-    agfs = AsyncAGFSClient(service._agfs)
-    raw = await agfs.read("/local/_system/session_auto_commit/index.json")
-    content = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
-
-    assert '"session_c"' in content
-
-    with pytest.raises(AGFSNotFoundError):
-        await agfs.read("/local/default/_system/session_auto_commit/index.json")
-
-
-async def test_idle_index_does_not_rewrite_existing_session_membership(service):
-    index = session_auto_commit.SessionAutoCommitIndex(service.viking_fs)
-    await index.initialize()
-    await index.upsert_session(
-        "acct_a",
-        "user_b",
-        "session_c",
-        next_check_at="2026-06-22T12:00:00+08:00",
-    )
-
-    agfs = AsyncAGFSClient(service._agfs)
-    first_raw = await agfs.read("/local/_system/session_auto_commit/index.json")
-    first_content = first_raw.decode("utf-8") if isinstance(first_raw, bytes) else str(first_raw)
-
-    await index.upsert_session(
-        "acct_a",
-        "user_b",
-        "session_c",
-        next_check_at="2026-06-22T13:00:00+08:00",
-    )
-
-    second_raw = await agfs.read("/local/_system/session_auto_commit/index.json")
-    second_content = (
-        second_raw.decode("utf-8") if isinstance(second_raw, bytes) else str(second_raw)
-    )
-
-    assert second_content == first_content
+    session_resp = await client.get(f"/api/v1/sessions/{session_id}")
+    result = session_resp.json()["result"]
+    assert result["auto_commit_policy"] == {
+        "enabled": True,
+        "token_threshold": None,
+        "idle_timeout_seconds": 60,
+        "keep_recent_count": 0,
+    }
 
 
 async def test_session_load_recovers_message_count_from_live_messages(service):
@@ -651,15 +617,6 @@ async def test_session_load_recovers_message_count_from_live_messages(service):
 
     assert len(reloaded.messages) == 1
     assert reloaded.meta.message_count == 1
-
-
-def test_auto_commit_index_uses_internal_control_path():
-    assert (
-        session_auto_commit.SESSION_AUTO_COMMIT_INDEX_URI
-        == "/local/_system/session_auto_commit/index.json"
-    )
-    assert "/resources/" not in session_auto_commit.SESSION_AUTO_COMMIT_INDEX_URI
-    assert "/default/" not in session_auto_commit.SESSION_AUTO_COMMIT_INDEX_URI
 
 
 async def test_add_message_accepts_image_part(client: httpx.AsyncClient, service):

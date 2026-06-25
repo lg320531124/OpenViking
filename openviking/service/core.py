@@ -430,10 +430,6 @@ class OpenVikingService:
                 check_interval=session_auto_commit_config.check_interval_seconds,
             )
             await self._session_auto_commit_scheduler.start()
-            if self._session_auto_commit_scheduler.index is not None:
-                self._session_service.set_auto_commit_index(
-                    self._session_auto_commit_scheduler.index
-                )
         else:
             self._session_auto_commit_scheduler = None
         self._debug_service.set_dependencies(

@@ -674,7 +674,9 @@ ov session delete a1b2c3d4
 
 - `auto_commit_policy` 是 session 级配置，不是单条 message 级配置。
 - 一旦写入，后续服务端自动触发以 session meta 中的持久化值为准。
+- `token_threshold` 会在消息写入后立即参与判断，不依赖 idle scheduler。
 - `idle_timeout_seconds` 是否生效，还取决于服务端全局配置 `server.session_auto_commit.idle_enabled` 是否开启。
+- 当 idle scheduler 开启后，服务端会通过固定周期扫描 session `.meta.json` 来判断哪些 session 到达 idle 触发条件。
 
 **Part 类型（Python SDK）**
 
