@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import openviking.service.session_auto_commit as auto_commit_module
 from openviking.server.identity import RequestContext
 from openviking.service.session_auto_commit import SessionAutoCommitScheduler
 
@@ -108,6 +109,7 @@ class _FakeSessionService:
             read_delay_seconds=read_delay_seconds,
         )
         self.calls: list[tuple[str, str, str]] = []
+        self.schedule_results: list[bool] = []
 
     async def maybe_schedule_auto_commit(
         self,
@@ -117,6 +119,8 @@ class _FakeSessionService:
         reason_hint: str,
     ):
         self.calls.append((session_id, reason_hint, ctx.user.user_id))
+        if self.schedule_results:
+            return self.schedule_results.pop(0)
         return True
 
 
@@ -182,7 +186,60 @@ async def test_scheduler_scans_agfs_paths_directly_without_account_user_indices(
         "/local/acct_a/user/user_b/sessions/session_due/.meta.json",
         "/local/acct_a/user/user_b/sessions/session_skip/.meta.json",
     ]
-    assert service.calls == [("session_due", "idle_timeout", "user_b")]
+    assert service.calls == [
+        ("session_due", "idle_timeout", "user_b"),
+        ("session_skip", "idle_timeout", "user_b"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_defers_uncommitted_content_check_to_session_service_for_stale_meta():
+    service = _FakeSessionService(
+        [_session_entry("session_with_stale_meta")],
+        {
+            "/local/acct_a/user/user_b/sessions/session_with_stale_meta/.meta.json": _meta(
+                pending_tokens=0,
+                message_count=0,
+            ),
+        },
+    )
+    scheduler = SessionAutoCommitScheduler(
+        service,
+        SimpleNamespace(idle_enabled=True, check_interval_seconds=60.0),
+        check_interval=60.0,
+    )
+
+    await scheduler._scan_once()
+
+    assert service.calls == [("session_with_stale_meta", "idle_timeout", "user_b")]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_logs_scheduled_count_separately_from_due_candidates(caplog):
+    service = _FakeSessionService(
+        [_session_entry("session_due_1"), _session_entry("session_due_2")],
+        {
+            "/local/acct_a/user/user_b/sessions/session_due_1/.meta.json": _meta(),
+            "/local/acct_a/user/user_b/sessions/session_due_2/.meta.json": _meta(),
+        },
+    )
+    service.schedule_results = [True, False]
+    scheduler = SessionAutoCommitScheduler(
+        service,
+        SimpleNamespace(idle_enabled=True, check_interval_seconds=60.0),
+        check_interval=60.0,
+    )
+
+    openviking_logger = logging.getLogger("openviking")
+    old_propagate = openviking_logger.propagate
+    openviking_logger.propagate = True
+    try:
+        with caplog.at_level(logging.INFO, logger="openviking.service.session_auto_commit"):
+            await scheduler._scan_once()
+    finally:
+        openviking_logger.propagate = old_propagate
+
+    assert "SessionAutoCommitScheduler scanned=2 due=2 scheduled=1" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -337,12 +394,12 @@ async def test_scheduler_warns_for_invalid_meta_json(caplog):
 
 
 @pytest.mark.asyncio
-async def test_scheduler_skips_malformed_meta_fields_without_aborting_batch(caplog):
+async def test_scheduler_skips_malformed_due_fields_without_aborting_batch(caplog):
     service = _FakeSessionService(
         [_session_entry("bad_session"), _session_entry("good_session")],
         {
-            "/local/acct_a/user/user_b/sessions/bad_session/.meta.json": _meta(pending_tokens=1)
-            | {"pending_tokens": "not-an-int"},
+            "/local/acct_a/user/user_b/sessions/bad_session/.meta.json": _meta()
+            | {"last_message_at": []},
             "/local/acct_a/user/user_b/sessions/good_session/.meta.json": _meta(),
         },
     )
@@ -352,16 +409,10 @@ async def test_scheduler_skips_malformed_meta_fields_without_aborting_batch(capl
         check_interval=60.0,
     )
 
-    openviking_logger = logging.getLogger("openviking")
-    old_propagate = openviking_logger.propagate
-    openviking_logger.propagate = True
-    try:
-        with caplog.at_level(logging.WARNING, logger="openviking.service.session_auto_commit"):
-            await scheduler._scan_once()
-    finally:
-        openviking_logger.propagate = old_propagate
+    with caplog.at_level(logging.WARNING, logger="openviking.service.session_auto_commit"):
+        await scheduler._scan_once()
 
-    assert "Invalid session meta fields for idle auto-commit" in caplog.text
+    assert "Session auto-commit scheduler loop failed" not in caplog.text
     assert service.calls == [("good_session", "idle_timeout", "user_b")]
 
 
@@ -389,3 +440,33 @@ async def test_scheduler_warns_for_non_missing_session_scan_errors(caplog):
 
     assert "Failed to scan sessions for idle auto-commit" in caplog.text
     assert service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_reuses_async_agfs_client_between_scans(monkeypatch):
+    service = _FakeSessionService(
+        [_session_entry("session_due")],
+        {
+            "/local/acct_a/user/user_b/sessions/session_due/.meta.json": _meta(),
+        },
+    )
+    created_clients = 0
+    real_client = auto_commit_module.AsyncAGFSClient
+
+    class _CountingAsyncAGFSClient(real_client):
+        def __init__(self, client):
+            nonlocal created_clients
+            created_clients += 1
+            super().__init__(client)
+
+    monkeypatch.setattr(auto_commit_module, "AsyncAGFSClient", _CountingAsyncAGFSClient)
+    scheduler = SessionAutoCommitScheduler(
+        service,
+        SimpleNamespace(idle_enabled=True, check_interval_seconds=60.0),
+        check_interval=60.0,
+    )
+
+    await scheduler._scan_once()
+    await scheduler._scan_once()
+
+    assert created_clients == 1

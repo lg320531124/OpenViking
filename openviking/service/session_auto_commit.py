@@ -48,6 +48,7 @@ class SessionAutoCommitScheduler:
         self._sleep = sleep
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._agfs_client: Optional[AsyncAGFSClient] = None
 
     async def start(self) -> None:
         if self._running:
@@ -85,25 +86,40 @@ class SessionAutoCommitScheduler:
         now = datetime.now()
         scanned = 0
         due = 0
-        agfs = AsyncAGFSClient(self._session_service.viking_fs.agfs)
+        scheduled = 0
+        agfs = self._get_agfs_client()
         async for batch in self._iter_session_meta_path_batches(agfs):
-            batch_scanned, batch_due = await self._process_meta_batch(agfs, batch, now)
+            batch_scanned, batch_due, batch_scheduled = await self._process_meta_batch(
+                agfs, batch, now
+            )
             scanned += batch_scanned
             due += batch_due
+            scheduled += batch_scheduled
 
         if due > 0:
-            logger.info("SessionAutoCommitScheduler scanned=%d due=%d", scanned, due)
+            logger.info(
+                "SessionAutoCommitScheduler scanned=%d due=%d scheduled=%d",
+                scanned,
+                due,
+                scheduled,
+            )
+
+    def _get_agfs_client(self) -> AsyncAGFSClient:
+        if self._agfs_client is None:
+            self._agfs_client = AsyncAGFSClient(self._session_service.viking_fs.agfs)
+        return self._agfs_client
 
     async def _process_meta_batch(
         self,
         agfs: AsyncAGFSClient,
         batch: list[str],
         now: datetime,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         results = await asyncio.gather(
             *(self._read_idle_candidate(agfs, meta_path, now) for meta_path in batch)
         )
         due = 0
+        scheduled = 0
         for item in results:
             if item is None:
                 continue
@@ -113,12 +129,14 @@ class SessionAutoCommitScheduler:
                 user=UserIdentifier(account_id=account_id, user_id=user_id),
                 role=Role.USER,
             )
-            await self._session_service.maybe_schedule_auto_commit(
+            did_schedule = await self._session_service.maybe_schedule_auto_commit(
                 session_id,
                 ctx,
                 reason_hint="idle_timeout",
             )
-        return len(batch), due
+            if did_schedule:
+                scheduled += 1
+        return len(batch), due, scheduled
 
     async def _read_idle_candidate(
         self,
@@ -307,24 +325,26 @@ def has_uncommitted_content(meta: Dict[str, Any]) -> bool:
     )
 
 
-def _coerce_non_negative_int(value: Any) -> int:
-    parsed = int(value or 0)
-    return max(0, parsed)
-
-
-def _is_idle_candidate(meta: Dict[str, Any], now: datetime) -> bool:
+def _is_idle_policy_due(meta: Dict[str, Any], now: datetime) -> bool:
     policy = meta.get("auto_commit_policy")
     if not should_enable_auto_commit(policy):
         return False
     idle_timeout = get_idle_timeout_seconds(policy)
     if idle_timeout is None:
         return False
-    if not has_uncommitted_content(meta):
-        return False
     next_check_at = compute_next_check_at(meta.get("last_message_at", ""), idle_timeout)
     if not next_check_at:
         return False
     return is_next_check_due(next_check_at, now) is True
+
+
+def _coerce_non_negative_int(value: Any) -> int:
+    parsed = int(value or 0)
+    return max(0, parsed)
+
+
+def _is_idle_candidate(meta: Dict[str, Any], now: datetime) -> bool:
+    return _is_idle_policy_due(meta, now)
 
 
 def _session_id_from_meta_path(meta_path: str) -> str:
